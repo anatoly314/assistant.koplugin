@@ -859,6 +859,25 @@ function Assistant:onDictButtonsReady(dict_popup, dict_buttons)
     end
   end
 
+  -- Local mod: Add Note (saves dict article HTML to <book>/<word>-<timestamp>.md, no AI)
+  table.insert(plugin_buttons, {
+    id = "assistant_add_dict_note",
+    text = _("Add Note"),
+    callback = function()
+      local assistant_utils = require("assistant_utils")
+      local article = assistant_utils.getDictArticleText(dict_popup)
+      if not article then
+        UIManager:show(InfoMessage:new{
+          icon = "notice-warning",
+          text = _("No dictionary article available"),
+          timeout = 3
+        })
+        return
+      end
+      assistant_utils.saveWordNote(self.ui, dict_popup.word, article)
+    end,
+  })
+
   if #plugin_buttons > 0 and #dict_buttons > 1 then
     table.insert(dict_buttons, 2, plugin_buttons) -- add to the last second row of buttons
   end

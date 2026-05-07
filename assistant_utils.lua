@@ -326,11 +326,116 @@ local function normalizeMarkdownHeadings(content, heading_offset, max_heading_le
   return normalized_content
 end
 
+-- Local mod helpers: per-word note files in <book>/ folder
+local function sanitizeFilename(s)
+  s = s:gsub("[/\\:%*%?\"<>|%c]", "_")
+  s = s:gsub("%s+", "_")
+  if #s > 60 then s = s:sub(1, 60) end
+  return s
+end
+
+local function saveWordNote(ui, word, content_body)
+  if not word or word == "" then
+    UIManager:show(InfoMessage:new{
+      icon = "notice-warning",
+      text = _("No word/phrase to save"),
+      timeout = 3
+    })
+    return false
+  end
+
+  if not content_body or content_body == "" then
+    UIManager:show(InfoMessage:new{
+      icon = "notice-warning",
+      text = _("No content to save"),
+      timeout = 3
+    })
+    return false
+  end
+
+  local doc_path = ui and ui.document and ui.document.file
+  if not doc_path then
+    UIManager:show(InfoMessage:new{
+      icon = "notice-warning",
+      text = _("Cannot determine book file path"),
+      timeout = 3
+    })
+    return false
+  end
+
+  local book_dir = doc_path:match("(.*/)") or "./"
+  local book_filename = doc_path:match("([^/\\]+)$") or "book"
+  local book_stem = book_filename:gsub("%.[^.]*$", "")
+  local notes_folder = book_dir .. book_stem
+
+  local lfs = require("libs/libkoreader-lfs")
+  local attr = lfs.attributes(notes_folder)
+  if not attr then
+    local ok, err = lfs.mkdir(notes_folder)
+    if not ok then
+      UIManager:show(InfoMessage:new{
+        icon = "notice-warning",
+        text = _("Could not create notes folder: ") .. tostring(err),
+        timeout = 3
+      })
+      return false
+    end
+  elseif attr.mode ~= "directory" then
+    UIManager:show(InfoMessage:new{
+      icon = "notice-warning",
+      text = _("Notes folder path exists but is not a directory"),
+      timeout = 3
+    })
+    return false
+  end
+
+  local safe_word = sanitizeFilename(word)
+  if safe_word == "" then safe_word = "note" end
+  local timestamp = os.date("%Y-%m-%dT%H-%M-%S")
+  local filename = safe_word .. "-" .. timestamp .. ".md"
+  local note_path = notes_folder .. "/" .. filename
+
+  local human_ts = os.date("%Y-%m-%d %H:%M:%S")
+  local content = string.format(
+    "# %s\n\n*Saved %s*\n\n> %s\n\n---\n\n%s\n",
+    word, human_ts, word, content_body
+  )
+
+  local file = io.open(note_path, "w")
+  if file then
+    file:write(content)
+    file:close()
+    UIManager:show(InfoMessage:new{
+      text = _("Note saved: ") .. filename,
+      timeout = 2
+    })
+    return true, note_path
+  else
+    UIManager:show(InfoMessage:new{
+      icon = "notice-warning",
+      text = _("Failed to write note file"),
+      timeout = 3
+    })
+    return false
+  end
+end
+
+local function getDictArticleText(dict_popup)
+  if not dict_popup or not dict_popup.results or not dict_popup.dict_index then
+    return nil
+  end
+  local result = dict_popup.results[dict_popup.dict_index]
+  if not result then return nil end
+  return result.definition
+end
+
 return {
     getGeneralNotebookFilePath = getGeneralNotebookFilePath,
     extractBookTextForAnalysis = extractBookTextForAnalysis,
     extractHighlightsNotesAndNotebook = extractHighlightsNotesAndNotebook,
     getPageInfo = getPageInfo,
     saveToNotebookFile = saveToNotebookFile,
-    normalizeMarkdownHeadings = normalizeMarkdownHeadings
+    normalizeMarkdownHeadings = normalizeMarkdownHeadings,
+    saveWordNote = saveWordNote,
+    getDictArticleText = getDictArticleText
 }

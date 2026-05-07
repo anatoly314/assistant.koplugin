@@ -370,14 +370,13 @@ function ChatGPTViewer:init()
   table.insert(buttons[#buttons], #(buttons[#buttons]), copy_button)
   
   -- Add a button to add notes.
-  -- Local mod: instead of attaching to a KOReader highlight, write the response
-  -- to <book_dir>/<book_stem>/<word>-<timestamp>.md (one note per file).
+  -- Local mod: instead of attaching to a KOReader highlight, write the AI
+  -- response to <book_dir>/<book_stem>/<word>-<timestamp>.md (one note per file).
+  -- Shared file-writing logic lives in assistant_utils.saveWordNote.
   local function createAddNoteButton(self)
       return {
           text = _("Add Note"),
           callback = function()
-              local ui = self.ui
-
               if not self.text or self.text == "" then
                   UIManager:show(InfoMessage:new{
                       icon = "notice-warning",
@@ -419,76 +418,8 @@ function ChatGPTViewer:init()
                   return
               end
 
-              local doc_path = ui and ui.document and ui.document.file
-              if not doc_path then
-                  UIManager:show(InfoMessage:new{
-                      icon = "notice-warning",
-                      text = _("Cannot determine book file path"),
-                      timeout = 3
-                  })
-                  return
-              end
-
-              local book_dir = doc_path:match("(.*/)") or "./"
-              local book_filename = doc_path:match("([^/\\]+)$") or "book"
-              local book_stem = book_filename:gsub("%.[^.]*$", "")
-              local notes_folder = book_dir .. book_stem
-
-              local lfs = require("libs/libkoreader-lfs")
-              local attr = lfs.attributes(notes_folder)
-              if not attr then
-                  local ok, err = lfs.mkdir(notes_folder)
-                  if not ok then
-                      UIManager:show(InfoMessage:new{
-                          icon = "notice-warning",
-                          text = _("Could not create notes folder: ") .. tostring(err),
-                          timeout = 3
-                      })
-                      return
-                  end
-              elseif attr.mode ~= "directory" then
-                  UIManager:show(InfoMessage:new{
-                      icon = "notice-warning",
-                      text = _("Notes folder path exists but is not a directory"),
-                      timeout = 3
-                  })
-                  return
-              end
-
-              local function sanitize(s)
-                  s = s:gsub("[/\\:%*%?\"<>|%c]", "_")
-                  s = s:gsub("%s+", "_")
-                  if #s > 60 then s = s:sub(1, 60) end
-                  return s
-              end
-
-              local safe_word = sanitize(selected_text)
-              if safe_word == "" then safe_word = "note" end
-              local timestamp = os.date("%Y-%m-%dT%H-%M-%S")
-              local filename = safe_word .. "-" .. timestamp .. ".md"
-              local note_path = notes_folder .. "/" .. filename
-
-              local human_ts = os.date("%Y-%m-%d %H:%M:%S")
-              local content = string.format(
-                  "# %s\n\n*Saved %s*\n\n> %s\n\n---\n\n%s\n",
-                  selected_text, human_ts, selected_text, note_text
-              )
-
-              local file = io.open(note_path, "w")
-              if file then
-                  file:write(content)
-                  file:close()
-                  UIManager:show(InfoMessage:new{
-                      text = _("Note saved: ") .. filename,
-                      timeout = 2
-                  })
-              else
-                  UIManager:show(InfoMessage:new{
-                      icon = "notice-warning",
-                      text = _("Failed to write note file"),
-                      timeout = 3
-                  })
-              end
+              local assistant_utils = require("assistant_utils")
+              assistant_utils.saveWordNote(self.ui, selected_text, note_text)
           end
       }
   end
