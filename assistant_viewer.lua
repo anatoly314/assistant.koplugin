@@ -389,6 +389,15 @@ function ChatGPTViewer:init()
 
               local selected_text = self.highlighted_text or ""
 
+              if selected_text == "" then
+                  UIManager:show(InfoMessage:new{
+                      icon = "notice-warning",
+                      text = _("No highlighted text on viewer; cannot name note file"),
+                      timeout = 3
+                  })
+                  return
+              end
+
               -- Strip "Highlighted text: ..." prefix if it duplicates selected_text
               local note_text = self.text
               local highlighted_start, highlighted_end = note_text:find('Highlighted text: "([^"]*)"')

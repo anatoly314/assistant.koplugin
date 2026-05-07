@@ -470,6 +470,7 @@ local function showDictionaryDialog(assistant, highlightedText, message_history,
         ui = ui,
         title = title,
         text = result,
+        highlighted_text = highlightedText,
         onAddToNote = handleAddToNote,
         default_hold_callback = function ()
             chatgpt_viewer:HoldClose()
