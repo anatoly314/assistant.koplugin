@@ -7,6 +7,59 @@ A powerful plugin that lets you interact with AI language models (Claude, GPT-4,
 
 <small>Originally forked from a deleted fork of AskGPT by zeeyado, then modified using WindSurf. That fork is now public and includes many updates: https://github.com/zeeyado/koassistant.koplugin </small>
 
+---
+
+## Local modifications (this fork: `anatoly314/assistant.koplugin`)
+
+Personal modifications on top of upstream [`omer-faruq/assistant.koplugin`](https://github.com/omer-faruq/assistant.koplugin). The bulk of the plugin is unchanged; differences below.
+
+### 1. `Add Note` writes a per-word file instead of attaching a KOReader highlight
+
+In upstream, **Add Note** in the AI response viewer attaches the response to a KOReader annotation. In this fork it writes to:
+
+```
+<book_dir>/<book_filename_without_extension>/<word>-<ISO_timestamp>.md
+```
+
+The book-named folder is created on first save. One save = one file. Each file contains a small markdown header (title, save timestamp, blockquoted highlight, separator) followed by the response body.
+
+**Side effect:** AI responses no longer appear in KOReader's Bookmarks/Annotations view. Trade-off accepted because per-file storage is friendlier to downstream LLM/script processing.
+
+Commits: [`0bbd28a`](https://github.com/anatoly314/assistant.koplugin/commit/0bbd28a), [`628737f`](https://github.com/anatoly314/assistant.koplugin/commit/628737f).
+
+### 2. New non-AI `Add Note` button in the Dictionary popup
+
+A new **Add Note** button appears at the end of the plugin's row in KOReader's Dictionary popup, alongside `Wikipedia (AI)` / `Dictionary (AI)`. Tapping it saves the **standard StarDict article currently displayed** (no AI call, no API tokens spent) to the same `<book>/<word>-<timestamp>.md` location as #1.
+
+The article is saved verbatim — if the dict source returns HTML, HTML is what gets written.
+
+Commit: [`20f8306`](https://github.com/anatoly314/assistant.koplugin/commit/20f8306).
+
+### 3. Shared file-save helpers in `assistant_utils.lua`
+
+Both Add Note paths above call:
+
+- `assistant_utils.saveWordNote(ui, word, content_body)` — folder creation, filename sanitization, file write, user toasts.
+- `assistant_utils.getDictArticleText(dict_popup)` — nil-safe extractor for `dict_popup.results[dict_popup.dict_index].definition`.
+
+Filename collisions (same word saved within the same second) are theoretically possible and would overwrite; accepted as the cost of simplicity.
+
+### Files changed vs. upstream
+
+`main.lua`, `assistant_viewer.lua`, `assistant_utils.lua`, `assistant_dictdialog.lua`, `README.md`. No KOReader core changes — everything uses published plugin extension points.
+
+### Syncing with upstream
+
+```bash
+git fetch upstream
+git merge upstream/main
+git push origin main
+```
+
+Conflicts, if any, will most likely be in `assistant_viewer.lua` (Add Note callback) and `main.lua` (`onDictButtonsReady`). Other files should fast-forward cleanly.
+
+---
+
 ## Features
 
 - **Multiple AI Providers**: Support for:
