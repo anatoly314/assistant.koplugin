@@ -369,22 +369,15 @@ function ChatGPTViewer:init()
   -- to keep close button on the right, insert into the second-to-last position
   table.insert(buttons[#buttons], #(buttons[#buttons]), copy_button)
   
-  -- Add a button to add notes
+  -- Add a button to add notes.
+  -- Local mod: instead of attaching to a KOReader highlight, write the response
+  -- to <book_dir>/<book_stem>/<word>-<timestamp>.md (one note per file).
   local function createAddNoteButton(self)
       return {
           text = _("Add Note"),
           callback = function()
-              -- Check if ui is available in self
               local ui = self.ui
-              if not ui or not ui.highlight then
-                  UIManager:show(InfoMessage:new{
-                      icon = "notice-warning",
-                      text = _("Highlight functionality not available"),
-                      timeout = 2
-                  })
-                  return
-              end
-              
+
               if not self.text or self.text == "" then
                   UIManager:show(InfoMessage:new{
                       icon = "notice-warning",
@@ -393,27 +386,21 @@ function ChatGPTViewer:init()
                   })
                   return
               end
-              
-              -- Get the selected text
+
               local selected_text = self.highlighted_text or ""
-              
-              -- Remove the selected text from the full text with multiple strategies
+
+              -- Strip "Highlighted text: ..." prefix if it duplicates selected_text
               local note_text = self.text
-              
-              -- First, try to remove only if the selected text is after "Highlighted text: "
               local highlighted_start, highlighted_end = note_text:find('Highlighted text: "([^"]*)"')
               if highlighted_start then
                   local highlighted_part = note_text:sub(highlighted_start, highlighted_end)
                   local selected_text_in_highlight = highlighted_part:match('"([^"]*)"')
-                  
                   if selected_text_in_highlight == selected_text then
                       note_text = note_text:gsub('Highlighted text: "' .. selected_text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1") .. '"', "")
                   end
               end
-              
-              -- Trim whitespace
               note_text = note_text:gsub("^%s+", ""):gsub("%s+$", "")
-                            
+
               if note_text == "" then
                   UIManager:show(InfoMessage:new{
                       icon = "notice-warning",
@@ -422,17 +409,77 @@ function ChatGPTViewer:init()
                   })
                   return
               end
-              
-              local index = ui.highlight:saveHighlight(true)
-              local a = ui.annotation.annotations[index]
-              a.note = note_text
-              ui:handleEvent(Event:new("AnnotationsModified", 
-                                      { a, nb_highlights_added = -1, nb_notes_added = 1 }))
-              
-              UIManager:show(InfoMessage:new{
-                  text = _("Note added successfully"),
-                  timeout = 2
-              })
+
+              local doc_path = ui and ui.document and ui.document.file
+              if not doc_path then
+                  UIManager:show(InfoMessage:new{
+                      icon = "notice-warning",
+                      text = _("Cannot determine book file path"),
+                      timeout = 3
+                  })
+                  return
+              end
+
+              local book_dir = doc_path:match("(.*/)") or "./"
+              local book_filename = doc_path:match("([^/\\]+)$") or "book"
+              local book_stem = book_filename:gsub("%.[^.]*$", "")
+              local notes_folder = book_dir .. book_stem
+
+              local lfs = require("libs/libkoreader-lfs")
+              local attr = lfs.attributes(notes_folder)
+              if not attr then
+                  local ok, err = lfs.mkdir(notes_folder)
+                  if not ok then
+                      UIManager:show(InfoMessage:new{
+                          icon = "notice-warning",
+                          text = _("Could not create notes folder: ") .. tostring(err),
+                          timeout = 3
+                      })
+                      return
+                  end
+              elseif attr.mode ~= "directory" then
+                  UIManager:show(InfoMessage:new{
+                      icon = "notice-warning",
+                      text = _("Notes folder path exists but is not a directory"),
+                      timeout = 3
+                  })
+                  return
+              end
+
+              local function sanitize(s)
+                  s = s:gsub("[/\\:%*%?\"<>|%c]", "_")
+                  s = s:gsub("%s+", "_")
+                  if #s > 60 then s = s:sub(1, 60) end
+                  return s
+              end
+
+              local safe_word = sanitize(selected_text)
+              if safe_word == "" then safe_word = "note" end
+              local timestamp = os.date("%Y-%m-%dT%H-%M-%S")
+              local filename = safe_word .. "-" .. timestamp .. ".md"
+              local note_path = notes_folder .. "/" .. filename
+
+              local human_ts = os.date("%Y-%m-%d %H:%M:%S")
+              local content = string.format(
+                  "# %s\n\n*Saved %s*\n\n> %s\n\n---\n\n%s\n",
+                  selected_text, human_ts, selected_text, note_text
+              )
+
+              local file = io.open(note_path, "w")
+              if file then
+                  file:write(content)
+                  file:close()
+                  UIManager:show(InfoMessage:new{
+                      text = _("Note saved: ") .. filename,
+                      timeout = 2
+                  })
+              else
+                  UIManager:show(InfoMessage:new{
+                      icon = "notice-warning",
+                      text = _("Failed to write note file"),
+                      timeout = 3
+                  })
+              end
           end
       }
   end
