@@ -1,5 +1,4 @@
-local http = require("socket.http")
-local ltn12 = require("ltn12")
+local BaseHandler = require("api_handlers.base")
 local json = require("json")
 local TrapWidget  = require("ui/widget/trapwidget")
 local Notification = require("ui/widget/notification")
@@ -106,26 +105,17 @@ local function checkForUpdates()
     text = _("Checking for updates..."),
   }
   UIManager:show(infomsg)
-  local success, code, body = Trapper:dismissableRunInSubprocess(function()
-    local response_body = {}
-    local _, code = http.request {
-      url = update_url,
-      headers = {
-          ["Accept"] = "application/vnd.github.v3+json"
-      },
-      sink = ltn12.sink.table(response_body)
-    }
-
-    return code, table.concat(response_body)
-  end, infomsg)
+  -- In-process non-blocking HTTPS GET (no fork → binder cache stays valid).
+  local headers = { ["Accept"] = "application/vnd.github.v3+json" }
+  local success, code, body = BaseHandler:simpleGet(update_url, headers, infomsg, 30)
   UIManager:close(infomsg)
 
-  if not success then
+  if code == BaseHandler.CODE_CANCELLED then
     logger.warn("user interrupted the update check.")
     return
   end
 
-  if code == 200 then
+  if success and code == 200 then
     local ok, parsed_data = pcall(json.decode, body)
     if not ok then
       logger.warn("Failed to parse update check response:", parsed_data) -- parsed_data contains the error

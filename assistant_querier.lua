@@ -11,10 +11,9 @@ local Size = require("ui/size")
 local koutil = require("util")
 local logger = require("logger")
 local rapidjson = require('rapidjson')
-local ffi = require("ffi")
-local ffiutil = require("ffi/util")
 local Device = require("device")
 local Screen = Device.screen
+local sse_parser = require("assistant_sse_parser")
 
 local Querier = {
     assistant = nil, -- reference to the main assistant object
@@ -176,7 +175,6 @@ function Querier:query(message_history, title)
 
     -- Set up waiting animation for non-streaming mode
     local animation = createWaitingAnimation()
-    local animation_task = nil
     local response_received = false
 
     local infomsg = InfoMessage:new{
@@ -187,27 +185,33 @@ function Querier:query(message_history, title)
 
     UIManager:show(infomsg)
 
-    -- Start animation for non-streaming mode
+    -- Start animation for non-streaming mode.
+    -- The recurring task self-references via `updateInfoMessage`, which
+    -- is also the handle we pass to UIManager:unschedule (it expects a
+    -- function reference, not the return value of scheduleIn — that's
+    -- nil). The self-check on response_received is a belt-and-braces
+    -- guard for the brief window where the function may already be
+    -- mid-execution when we cancel.
     local initial_text = infomsg.text
     local function updateInfoMessage()
         if not response_received then
             infomsg.text = initial_text .. "\n" .. animation:getNextFrame()
             UIManager:setDirty(infomsg)
-            animation_task = UIManager:scheduleIn(0.4, updateInfoMessage)
+            UIManager:scheduleIn(0.4, updateInfoMessage)
         end
     end
-    animation_task = UIManager:scheduleIn(0.4, updateInfoMessage)
+    UIManager:scheduleIn(0.4, updateInfoMessage)
 
+    -- The trap widget hands a Stop dismiss path to the request, so the user
+    -- can cancel a slow non-streaming query mid-flight. The new HTTP path is
+    -- coroutine-driven and never forks, so this no longer touches binder.
     self.handler:setTrapWidget(infomsg)
     local res, err = self.handler:query(trimMessageHistory(message_history), self.provider_settings)
     self.handler:resetTrapWidget()
 
     -- Stop animation
     response_received = true
-    if animation_task then
-        UIManager:unschedule(animation_task)
-        animation_task = nil
-    end
+    UIManager:unschedule(updateInfoMessage)
 
     UIManager:close(infomsg)
 
@@ -216,13 +220,18 @@ function Querier:query(message_history, title)
     if type(res) == "function" then
         self.user_interrupted = false -- reset the stream interrupted flag
         local streamDialog
-        local animation_task = nil -- Will be set during animation setup
+        -- updateAnimation is defined further down (after streamDialog
+        -- exists). Forward-declared here so _closeStreamDialog can
+        -- unschedule it. UIManager:unschedule wants the function ref,
+        -- not the return value of scheduleIn (which is nil).
+        local updateAnimation
+        local animation_active = false
 
         local function _closeStreamDialog()
             if self.interrupt_stream then self.interrupt_stream() end
-            if animation_task then
-                UIManager:unschedule(animation_task)
-                animation_task = nil
+            if animation_active and updateAnimation then
+                UIManager:unschedule(updateAnimation)
+                animation_active = false
             end
             UIManager:close(streamDialog)
         end
@@ -278,15 +287,19 @@ function Querier:query(message_history, title)
         local animation = createWaitingAnimation()
         local first_content_received = false
 
-        -- Start animation
+        -- Start animation. updateAnimation was forward-declared above
+        -- (so _closeStreamDialog can unschedule it); we assign the body
+        -- here. Self-check on first_content_received covers the race
+        -- where the function is mid-flight when we cancel.
         streamDialog._input_widget:setText(animation:getNextFrame(), true)
-        local function updateAnimation()
+        updateAnimation = function()
             if not first_content_received then
                 streamDialog._input_widget:setText(animation:getNextFrame(), true)
-                animation_task = UIManager:scheduleIn(0.4, updateAnimation)
+                UIManager:scheduleIn(0.4, updateAnimation)
             end
         end
-        animation_task = UIManager:scheduleIn(0.4, updateAnimation)
+        animation_active = true
+        UIManager:scheduleIn(0.4, updateAnimation)
 
         local stream_mode_auto_scroll = self.settings:readSetting("stream_mode_auto_scroll", true)
         local ok, content, err = pcall(self.processStream, self, res, function (content, buffer)
@@ -294,9 +307,9 @@ function Querier:query(message_history, title)
                 -- Stop animation on first content
                 if not first_content_received and content and #tostring(content) > 0 then
                     first_content_received = true
-                    if animation_task then
-                        UIManager:unschedule(animation_task)
-                        animation_task = nil
+                    if animation_active and updateAnimation then
+                        UIManager:unschedule(updateAnimation)
+                        animation_active = false
                     end
                     streamDialog._input_widget:setText("", true) -- Clear the animation
                 end
@@ -324,7 +337,7 @@ function Querier:query(message_history, title)
         end
 
         if err then
-            return nil, err:gsub("^[\n%s]*", "") -- clean leading spaces and newlines
+            return nil, tostring(err):gsub("^[\n%s]*", "") -- clean leading spaces and newlines
         end
 
         res = content
@@ -343,187 +356,152 @@ function Querier:query(message_history, title)
     return res
 end
 
---- func description: run the stream request in the background 
---  and process the response in realtime, output to the trunk callback
--- return the full response content when the stream ends
-function Querier:processStream(bgQuery, trunk_callback)
-    local pid, parent_read_fd = ffiutil.runInSubProcess(bgQuery, true) -- pipe: true
+--- Run the streaming request driven by the handler-built bgQuery callable.
+--- bgQuery(on_chunk, dismiss_check, maxtime) -> success, code, msg
+--- Replaces the old fork+pipe scheme; everything stays in-process with
+--- coroutine yielding inside the HTTP layer. SSE parsing is identical
+--- to the previous implementation — we only swapped the byte source.
+function Querier:processStream(bgQuery, chunk_callback)
+    local non200 = false           -- flag if we got a non-2xx response from the API
+    local partial_data = ""        -- Buffer for incomplete SSE line data
+    local result_buffer = {}       -- Final assembled message text
+    local reasoning_content_buffer = {}  -- Reasoning trace, if provider exposes it
+    local stop_requested = false   -- early exit signal from SSE [DONE]
 
-    if not pid then
-        logger.warn("Failed to start background query process.")
-        return nil, _("Failed to start subprocess for request")
+    -- Cooperative cancellation: the Stop button (set up in Querier:query)
+    -- writes to self.user_interrupted; the HTTP layer polls it.
+    -- We also short-circuit the body loop on `[DONE]` so the user feels
+    -- the response complete the moment the last token arrived, instead of
+    -- waiting for the server to close the connection. The polling layer
+    -- distinguishes user-cancel from done-short-circuit by checking
+    -- `stop_requested` after bgQuery returns.
+    self.interrupt_stream = function()
+        self.user_interrupted = true
+    end
+    local dismiss_check = function()
+        return self.user_interrupted == true or stop_requested == true
     end
 
-    local _coroutine = coroutine.running()  
-  
-    self.interrupt_stream = function()  
-        coroutine.resume(_coroutine, false)  
-    end  
-  
-    local non200 = false -- flag to indicate if we received a non-200 response
-    local check_interval_sec = 0.125 -- loop check interval: 125ms  
-    local chunksize = 1024 * 16 -- buffer size for reading data
-    local buffer = ffi.new('char[?]', chunksize, {0}) -- Buffer for reading data
-    local buffer_ptr = ffi.cast('void*', buffer)
-    local completed = false   -- Flag to indicate if the reading is completed
-    local partial_data = ""   -- Buffer for incomplete line data
-    local result_buffer = {}  -- Buffer for storing results
-    local reasoning_content_buffer = {}  -- Buffer for storing results
-
-    while true do  
-
-        if completed then break end
-  
-        -- Schedule next check and yield control  
-        local go_on_func = function() coroutine.resume(_coroutine, true) end  
-        UIManager:scheduleIn(check_interval_sec, go_on_func)  
-        local go_on = coroutine.yield()  -- Wait for the next check or user interruption
-        if not go_on then -- User interruption  
-            self.user_interrupted = true
-            logger.info("User interrupted the stream processing")
-            UIManager:unschedule(go_on_func)  
-            break  
-        end  
-
-        local readsize = ffiutil.getNonBlockingReadSize(parent_read_fd) 
-        if readsize > 0 then
-            local bytes_read = tonumber(ffi.C.read(parent_read_fd, buffer_ptr, chunksize))
-            if bytes_read < 0 then
-                local err = ffi.errno()
-                logger.warn("readAllFromFD() error: " .. ffi.string(ffi.C.strerror(err)))
-                break
-            elseif bytes_read == 0 then -- EOF, no more data to read
-                completed = true
-                break
-            else
-                -- Convert binary data to string and append to partial buffer
-                local data_chunk = ffi.string(buffer, bytes_read)
-                partial_data = partial_data .. data_chunk
-                
-                -- Process complete lines
-                while true do
-                    -- Find the next newline character
-                    local line_end = partial_data:find("[\r\n]")
-                    if not line_end then break end  -- No complete line yet, continue reading
-                    
-                    -- Extract the complete line
-                    local line = partial_data:sub(1, line_end - 1)
-                    partial_data = partial_data:sub(line_end + 1)
-                    
-                    -- Check if this is an Server-Sent-Event (SSE) data line
-                    if line:sub(1, 6) == "data: " then
-                        -- Clean up the JSON string (remove "data:" prefix and trim whitespace)
-                        local json_str = koutil.trim(line:sub(7))
-                        if json_str == '[DONE]' then break end -- end of SSE stream
-
-                        -- Safely parse the JSON
-                        local ok, event = pcall(rapidjson.decode, json_str, {null = nil})
-                        if ok and event then
-                        
-                            local reasoning_content, content
-
-                            local choice = koutil.tableGetValue(event, "choices", 1)
-                            if choice then -- OpenAI (compatiable) API
-                                if koutil.tableGetValue(choice, "finish_reason") then content="\n" end
-                                local delta = koutil.tableGetValue(choice, "delta")
-                                if delta then
-                                    reasoning_content = koutil.tableGetValue(delta, "reasoning_content")
-                                    content = koutil.tableGetValue(delta, "content")
-                                    -- gork4 ouputs empty reasoning messages, logs '.' here to indicate the process works
-                                    if not content and not reasoning_content then reasoning_content = "." end
-                                end
-                            else
-                                content =
-                                    koutil.tableGetValue(event, "candidates", 1, "content", "parts", 1, "text") or  -- Genmini API
-                                    koutil.tableGetValue(event, "delta", "text") or   -- Anthropic streaming (content_block_delta)
-                                    koutil.tableGetValue(event, "content", 1, "text") -- Anthropic non-stream message event
-                            end
-                                
-                            if type(content) == "string" and #content > 0 then
-                                table.insert(result_buffer, content)
-                                if trunk_callback then trunk_callback(content, result_buffer) end
-                            elseif type(reasoning_content) == "string" and #reasoning_content > 0 then
-                                table.insert(reasoning_content_buffer, reasoning_content)
-                                if trunk_callback then trunk_callback(reasoning_content, reasoning_content_buffer) end
-                            elseif content == nil and reasoning_content == nil then
-                                logger.warn("Unexpected SSE data:", json_str)
-                            end
-                        else
-                            logger.warn("Failed to parse JSON from SSE data:", json_str)
-                        end
-                    elseif line:sub(1, 7) == "event: " then
-                        -- Ignore SSE event lines (from Anthropic)
-                    elseif line:sub(1, 1) == ":" then
-                        -- SSE empty events, nothing to do
-                    elseif line:sub(1, 1) == "{" then
-                        -- If the line starts with '{', it might be a JSON object
-                        local ok, j = pcall(rapidjson.decode, line, {null=nil})
-                        if ok and j then
-                            -- log the json
-                            local err_message = koutil.tableGetValue(j, "error", "message")
-                            if err_message then
-                                table.insert(result_buffer, err_message)
-                            end
-
-                            if trunk_callback then
-                                trunk_callback(line)  -- Output to trunk callback
-                                logger.info("JSON object received:", line)
-                            end
-                        else
-                            -- the json was breaked into lines, just log the raw line
-                            table.insert(result_buffer, line)  -- Add the raw line to the result
-                        end
-                    elseif line:sub(1, #(self.handler.PROTOCOL_NON_200)) == self.handler.PROTOCOL_NON_200 then
-                        -- child writes a non-200 response 
-                        non200 = true
-                        table.insert(result_buffer, "\n\n" .. line:sub(#(self.handler.PROTOCOL_NON_200)+1))
-                        break -- the request is done, no more data to read
-                    else
-                        if #koutil.trim(line) > 0 then
-                            -- If the line is not empty, log it as a warning
-                            table.insert(result_buffer, line)  -- Add the raw line to the result
-                            logger.warn("Unrecognized line format:", line)
-                        end
+    -- Per-line SSE callback. parseSSE handles the line splitting; this
+    -- handles JSON decode + business logic. Returning false signals
+    -- parseSSE to stop processing further lines in the current buffer
+    -- (used when [DONE] arrives).
+    local function on_sse_line(event_type, payload)
+        if event_type == "data" then
+            local json_str = payload
+            if json_str == '[DONE]' then
+                stop_requested = true
+                return false  -- short-circuit parseSSE
+            end
+            local ok, event = pcall(rapidjson.decode, json_str, {null = nil})
+            if ok and event then
+                local reasoning_content, content
+                local choice = koutil.tableGetValue(event, "choices", 1)
+                if choice then -- OpenAI (compatible) API shape
+                    if koutil.tableGetValue(choice, "finish_reason") then content="\n" end
+                    local delta = koutil.tableGetValue(choice, "delta")
+                    if delta then
+                        reasoning_content = koutil.tableGetValue(delta, "reasoning_content")
+                        content = koutil.tableGetValue(delta, "content")
+                        -- grok4 emits empty reasoning frames; '.' is a heartbeat.
+                        if not content and not reasoning_content then reasoning_content = "." end
                     end
+                else
+                    content =
+                        koutil.tableGetValue(event, "candidates", 1, "content", "parts", 1, "text") or  -- Gemini
+                        koutil.tableGetValue(event, "delta", "text") or                                  -- Anthropic stream
+                        koutil.tableGetValue(event, "content", 1, "text")                                -- Anthropic non-stream
                 end
+
+                if type(content) == "string" and #content > 0 then
+                    table.insert(result_buffer, content)
+                    if chunk_callback then chunk_callback(content, result_buffer) end
+                elseif type(reasoning_content) == "string" and #reasoning_content > 0 then
+                    table.insert(reasoning_content_buffer, reasoning_content)
+                    if chunk_callback then chunk_callback(reasoning_content, reasoning_content_buffer) end
+                elseif content == nil and reasoning_content == nil then
+                    logger.warn("Unexpected SSE data:", json_str)
+                end
+            else
+                logger.warn("Failed to parse JSON from SSE data:", json_str)
             end
-        elseif readsize == 0 then
-            -- No data to read, check if subprocess is done
-            completed = ffiutil.isSubProcessDone(pid)
+        elseif event_type == "event" then
+            -- Anthropic event types; we read them via "data:" lines
         else
-            -- Error reading from the file descriptor
-            local err = ffi.errno()
-            logger.warn("Error reading from parent_read_fd:", err, ffi.string(ffi.C.strerror(err)))
-            break
+            -- event_type == nil: unrecognized line (or bare JSON object).
+            local line = payload
+            if line:sub(1, 1) == "{" then
+                local ok, j = pcall(rapidjson.decode, line, {null=nil})
+                if ok and j then
+                    local err_message = koutil.tableGetValue(j, "error", "message")
+                    if err_message then
+                        table.insert(result_buffer, err_message)
+                    end
+                    if chunk_callback then
+                        chunk_callback(line)
+                        logger.info("JSON object received:", line)
+                    end
+                else
+                    table.insert(result_buffer, line)
+                end
+            else
+                table.insert(result_buffer, line)
+                logger.warn("Unrecognized line format:", line)
+            end
         end
     end
 
-    ffiutil.terminateSubProcess(pid) -- Terminate the subprocess when user interrupted 
-    self.interrupt_stream = nil  -- Clear the interrupt function
+    -- One SSE/HTTP byte chunk arrived. Append it to the rolling buffer
+    -- and let parseSSE drain whatever complete lines are now present.
+    -- Identical line-splitting semantics to the previous inline loop.
+    local function on_chunk(data_chunk)
+        if stop_requested then return end
+        partial_data = partial_data .. data_chunk
+        partial_data = sse_parser.parseSSE(partial_data, on_sse_line)
+    end
 
-    -- read loop ended, clean up subprocess
-    local collect_interval_sec = 5 -- collect cancelled cmd every 5 second, no hurry
-    local collect_and_clean
-    collect_and_clean = function()
-        if ffiutil.isSubProcessDone(pid) then
-            if parent_read_fd then
-                ffiutil.readAllFromFD(parent_read_fd) -- close it
+    self.user_interrupted = false
+    local success, code, msg = bgQuery(on_chunk, dismiss_check, 300)
+
+    self.interrupt_stream = nil
+
+    -- Network/transport errors get surfaced verbatim. CODE_CANCELLED is
+    -- handled specially in Querier:query.
+    --
+    -- Three CODE_CANCELLED paths exist now:
+    --   1) user hit Stop -> self.user_interrupted == true        -> error
+    --   2) SSE [DONE] short-circuited the body loop -> stop_requested -> SUCCESS
+    --   3) (defensive) neither flag set -> treat as user cancel
+    -- `stop_requested` wins over `user_interrupted` only when user_interrupted
+    -- is false, so a Stop press that races with [DONE] still surfaces as cancel.
+    if not success then
+        if code == self.handler.CODE_CANCELLED then
+            if self.user_interrupted then
+                return nil, _("Request cancelled by user.")
+            elseif stop_requested then
+                -- Treat as success: the stream completed cleanly via [DONE]
+                -- and we just stopped reading the trailing keepalive bytes.
+                success = true
+            else
+                self.user_interrupted = true
+                return nil, _("Request cancelled by user.")
             end
-            logger.dbg("collected previously dismissed subprocess")
+        elseif self.user_interrupted then
+            self.user_interrupted = true
+            return nil, _("Request cancelled by user.")
+        elseif type(code) == "number" and code >= 400 then
+            -- API returned non-2xx; body bytes were collected via on_chunk.
+            -- Fall through to the non200 path so we can extract the error message.
+            non200 = true
         else
-            if parent_read_fd and ffiutil.getNonBlockingReadSize(parent_read_fd) ~= 0 then
-                -- If subprocess started outputting to fd, read from it,
-                -- so its write() stops blocking and subprocess can exit
-                ffiutil.readAllFromFD(parent_read_fd)
-                -- We closed our fd, don't try again to read or close it
-                parent_read_fd = nil
-            end
-            -- reschedule to collect it
-            UIManager:scheduleIn(collect_interval_sec, collect_and_clean)
-            logger.dbg("previously dismissed subprocess not yet collectable")
+            return nil, tostring(msg or code or "request failed")
         end
     end
-    UIManager:scheduleIn(collect_interval_sec, collect_and_clean)
+
+    -- Flush any trailing partial line that didn't end in CRLF.
+    if #partial_data > 0 then
+        on_chunk("\n")
+    end
 
     local ret = koutil.trim(table.concat(result_buffer))
     if non200 then

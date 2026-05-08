@@ -1,6 +1,5 @@
 --- OpenRouter model picker — fetch and select models from UI
-local http = require("socket.http")
-local ltn12 = require("ltn12")
+local BaseHandler = require("api_handlers.base")
 local json = require("json")
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
@@ -17,7 +16,6 @@ local RadioButtonTable = require("ui/widget/radiobuttontable")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TrapWidget = require("ui/widget/trapwidget")
-local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local koutil = require("util")
@@ -30,31 +28,26 @@ local OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 -- Forward declarations
 local showPickerDialog, showManualInput
 
---- Fetch models list from OpenRouter API (runs in dismissable subprocess)
+--- Fetch models list from OpenRouter API. Uses the in-process non-blocking
+--- HTTP path (no fork), so the binder cache stays valid.
 local function fetchOpenRouterModels()
     local infomsg = TrapWidget:new{
         text = _("Fetching models..."),
     }
     UIManager:show(infomsg)
 
-    local success, code, body = Trapper:dismissableRunInSubprocess(function()
-        local response_body = {}
-        local _, rcode = http.request{
-            url = OPENROUTER_MODELS_URL,
-            headers = {
-                ["Accept"] = "application/json",
-            },
-            sink = ltn12.sink.table(response_body),
-        }
-        return rcode, table.concat(response_body)
-    end, infomsg)
+    local headers = { ["Accept"] = "application/json" }
+    local success, code, body = BaseHandler:simpleGet(
+        OPENROUTER_MODELS_URL, headers, infomsg, 30)
 
     UIManager:close(infomsg)
 
-    if not success then
+    if code == BaseHandler.CODE_CANCELLED then
         return nil
     end
-
+    if not success then
+        return nil, T(_("Failed to fetch models (HTTP %1)."), tostring(code) or "?")
+    end
     if code ~= 200 then
         return nil, T(_("Failed to fetch models (HTTP %1)."), code or "?")
     end
