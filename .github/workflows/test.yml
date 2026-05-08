@@ -1,0 +1,28 @@
+# Run unit tests on every push and pull request.
+# Tests live in test/ and execute with plain Lua (no busted/external deps).
+
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Test on both standard Lua 5.1 and LuaJIT 2.1 (the runtime KOReader bundles).
+      # leafo/gh-actions-lua creates a `lua` symlink for either, so the same `lua`
+      # invocation works for both.
+      matrix:
+        lua: ["5.1", "luajit-2.1"]
+    name: lua ${{ matrix.lua }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leafo/gh-actions-lua@v13
+        with:
+          luaVersion: ${{ matrix.lua }}
+      - name: Run tests
+        run: lua run_tests.lua
+        working-directory: test
