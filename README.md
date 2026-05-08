@@ -44,9 +44,47 @@ Both Add Note paths above call:
 
 Filename collisions (same word saved within the same second) are theoretically possible and would overwrite; accepted as the cost of simplicity.
 
+### 4. Coroutine-driven HTTP client (no `fork()`)
+
+Upstream sends HTTPS requests through `Trapper:dismissableRunInSubprocess` and `ffiutil.runInSubProcess`, both of which call `fork()` from KOReader's Java VM process. On Android (verified on Boox Note X5, Android 13) the child's `exit()` leaves the parent's cached `MediaPlayerService` binder proxy stale: every subsequent `MediaPlayer.setDataSource(...)` in the same KOReader process fails with `FAILED BINDER TRANSACTION` until KOReader is restarted. This breaks any plugin that plays audio via `MediaPlayer` after AI Dictionary has been used (e.g. [`speakword.koplugin`](https://github.com/anatoly314/speakword.koplugin)'s ElevenLabs path).
+
+This fork replaces both fork sites with a from-scratch HTTP/1.1 client over `socket.tcp() + ssl.wrap()` (luasec non-blocking mode), yielding to KOReader's `UIManager` between socket reads. The public API of `BaseHandler` (`makeRequest`, `backgroundRequest`, `simpleGet`) is unchanged; all 12 provider handlers continue working without modification.
+
+**No behavior change on non-Android platforms.** Linux/Kobo/Kindle continue to work identically — the rewrite is functionally a drop-in replacement that happens to also be Android-safe.
+
+Bundled improvements landed in the same commit:
+
+- `_streamingHttpsRequest` split into focused helpers (`connectAndUpgrade`, `sendRequest`, `readResponseHeaders`, `readResponseBody`) for SRP.
+- SSE parser extracted to `assistant_sse_parser.lua` (zero dependencies, easy to test).
+- `[DONE]` SSE marker short-circuits the body read loop instead of waiting for server close.
+- `timeout` parameter on `makeRequest` now actually drives the connect-phase timeout (was silently dropped).
+- `trap_widget.dismiss_callback` always restored on exit, including when the prior was `nil`.
+- `UIManager:unschedule` now passed the function reference (was a no-op against the `nil` return value of `scheduleIn`).
+- Various small fixes from a code review (`tostring(err)` wrap before string ops, SNI pcall failure logging, `trunk_callback` typo rename).
+
+Commit: [`ca0036c`](https://github.com/anatoly314/assistant.koplugin/commit/ca0036c).
+
+### 5. Test suite + CI
+
+`test/` contains 158 unit tests for the parsers — URL parsing, HTTP status/headers/chunked transfer, request building, and SSE event splitting. Tests run under plain Lua 5.1+ with no external dependencies (no busted, no mocking framework, no KOReader runtime).
+
+Run locally:
+
+```bash
+cd test && lua run_tests.lua
+```
+
+`.github/workflows/test.yml` runs the suite on every push and pull request against both Lua 5.1 and LuaJIT 2.1 (the latter matches KOReader's bundled runtime).
+
+Commit: [`f2598f5`](https://github.com/anatoly314/assistant.koplugin/commit/f2598f5).
+
 ### Files changed vs. upstream
 
-`main.lua`, `assistant_viewer.lua`, `assistant_utils.lua`, `assistant_dictdialog.lua`, `README.md`. No KOReader core changes — everything uses published plugin extension points.
+Modified: `main.lua`, `assistant_viewer.lua`, `assistant_utils.lua`, `assistant_dictdialog.lua`, `api_handlers/base.lua`, `assistant_querier.lua`, `assistant_model_picker.lua`, `assistant_update_checker.lua`, `README.md`.
+
+New: `assistant_sse_parser.lua`, `test/`, `.github/workflows/test.yml`.
+
+No KOReader core changes — everything uses published plugin extension points.
 
 ### Syncing with upstream
 
